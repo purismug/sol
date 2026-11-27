@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>솔해연 인력관리</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1f6f78">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  :root { --brand: #1f6f78; --ink: #1f2937; --muted: #6b7280; --bg: #f4f6f9; --card: #fff; --line: #e5e7eb; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+         display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .card { width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+          padding: 32px 24px; text-align: center; box-shadow: 0 6px 24px rgba(0,0,0,.06); }
+  .logo { width: 56px; height: 56px; border-radius: 12px; margin: 0 auto 14px; display: block; }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
+  #gbtn { display: flex; justify-content: center; margin: 22px 0 6px; min-height: 44px; }
+  #msg { min-height: 20px; margin-top: 12px; font-size: 13px; }
+  #msg.err { color: #b91c1c; }
+  .foot { margin-top: 18px; font-size: 12px; color: var(--muted); }
+  .foot a { color: var(--brand); }
+</style>
+</head>
+<body>
+<div class="card" id="loginCard">
+  <img class="logo" src="icon-192.png" alt="">
+  <h1>솔해연 인력관리</h1>
+  <p>솔해연기술 주식회사 · 인력관리시스템<br>등록된 Google 계정으로 로그인하세요.</p>
+  <div id="gbtn"></div>
+  <div id="msg">로그인 준비 중…</div>
+  <div class="foot">다른 계정으로 바꾸려면 <a href="?logout=1">여기</a> · <a href="privacy.html">개인정보 처리 안내</a></div>
+</div>
+
+<script>
+/* ─────────────────────────────────────────────────────────────
+ * 솔해연 인력관리 — 입구 페이지 (GitHub Pages) · DY 프로젝트 관리 v2.0 방식
+ *
+ *  1) Google 로그인(Google Identity Services) → 이메일 확인용 ID 토큰
+ *  2) BE가 ID 토큰을 구글에 확인 → 1시간 접속 토큰 + 앱 화면(HTML) 발급
+ *  3) 이 페이지가 앱 화면을 띄우고, 화면의 서버 호출을 BE로 직접 보냄
+ *
+ *  아래 두 값만 채우면 됩니다 (둘 다 공개되어도 되는 값, 비밀 아님).
+ * ───────────────────────────────────────────────────────────── */
+(function () {
+  'use strict';
+  const CONFIG = {
+    CLIENT_ID: 'PASTE_CLIENT_ID.apps.googleusercontent.com',
+    BE_URL:    'PASTE_BE_URL'   // Apps Script 웹 앱 URL (…/exec)
+  };
+  // 전역 이름을 만들지 않음: 앱 화면 코드와 이름이 겹치지 않게 모든 코드를 이 함수 안에 둠
+  const qs = new URLSearchParams(location.search);
+  const KEY = 'sol.auth.v1';
+  const store = {
+    get() { try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { return null; } },
+    set(v) { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} },
+    clear() { try { localStorage.removeItem(KEY); } catch (e) {} }
+  };
+  const $msg = () => document.getElementById('msg');
+  function say(text, isErr) { const m = $msg(); if (m) { m.textContent = text || ''; m.className = isErr ? 'err' : ''; } }
+
+  window.SOL_DEBUG = qs.get('debug') === '1';
+  window.SOL_NODIRECT = false;
+  window.SOL_BE = CONFIG.BE_URL;
+
+  /* ───── BE 통신 ───── */
+  async function post(obj) {
+    const res = await fetch(CONFIG.BE_URL, { method: 'POST', redirect: 'follow', body: JSON.stringify(obj) });
+    if (!res.ok) throw new Error('서버 응답 오류 (HTTP ' + res.status + ')');
+    const j = await res.json();
+    if (!j || !j.ok) { const e = new Error((j && j.message) || '알 수 없는 오류'); e.code = j && j.code; throw e; }
+    return j.result;
+  }
+  function remember(r) {
+    const auth = { token: r.token, email: r.email, exp: Date.now() + (Number(r.minutes) || 60) * 60000 - 60000 };
+    store.set(auth);
+    return auth;
+  }
+
+  /* ───── Google 로그인 ───── */
+  let gisReady = false, credWaiters = [];
+  function loadGis() {
+    return new Promise((resolve, reject) => {
+      if (window.google && google.accounts && google.accounts.id) return resolve();
+      const s = document.createElement('script');
+      s.src = 'https://accounts.google.com/gsi/client'; s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('Google 로그인 모듈을 불러오지 못했습니다. 네트워크를 확인하세요.'));
+      document.head.appendChild(s);
+    });
+  }
+  async function initGis() {
+    await loadGis();
+    if (gisReady) return;
+    google.accounts.id.initialize({
+      client_id: CONFIG.CLIENT_ID,
+      callback: onCredential,
+      auto_select: true,              // 이전에 로그인한 계정이 하나면 자동 로그인
+      cancel_on_tap_outside: false,
+      itp_support: true,
+      use_fedcm_for_prompt: true
+    });
+    gisReady = true;
+  }
+  function renderButton(el) {
+    el.innerHTML = '';
+    google.accounts.id.renderButton(el, { theme: 'filled_blue', size: 'large', text: 'signin_with', shape: 'pill', locale: 'ko', width: 260 });
+  }
+  function waitCredential() { return new Promise(resolve => credWaiters.push(resolve)); }
+  function onCredential(resp) {
+    const ws = credWaiters; credWaiters = [];
+    ws.forEach(w => w(resp && resp.credential));
+  }
+
+  /* ───── 첫 화면: 로그인 → 앱 실행 ───── */
+  async function start() {
+    if (qs.has('logout')) {
+      store.clear();
+      try { await loadGis(); google.accounts.id.disableAutoSelect(); } catch (e) {}
+      history.replaceState(null, '', location.pathname);
+    }
+    if (CONFIG.CLIENT_ID.indexOf('PASTE_') === 0 || CONFIG.BE_URL.indexOf('PASTE_') === 0) {
+      return say('설정값(CLIENT_ID 또는 BE_URL)이 입력되지 않았습니다. 관리자에게 문의하세요.', true);
+    }
+    // 1시간 안에 다시 열면 로그인 없이 바로 실행
+    const saved = store.get();
+    if (saved && saved.token && saved.exp - Date.now() > 3 * 60000) {
+      say('불러오는 중…');
+      try { const r = await post({ want: 'app', token: saved.token }); return launch(saved, r.html); }
+      catch (e) { store.clear(); }
+    }
+    try { await initGis(); } catch (e) { return say(e.message, true); }
+    renderButton(document.getElementById('gbtn'));
+    say('');
+    google.accounts.id.prompt();
+    while (true) {
+      const cred = await waitCredential();
+      if (!cred) continue;
+      say('계정 확인 중…');
+      try {
+        const r = await post({ idToken: cred, want: 'app' });
+        return launch(remember(r), r.html);
+      } catch (e) {
+        say(e.message || '로그인에 실패했습니다.', true);
+      }
+    }
+  }
+
+  /* ───── 접속 토큰 재발급 (1시간 만료 시 화면이 호출) ───── */
+  let refreshing = null;
+  function refreshToken() {
+    if (refreshing) return refreshing;
+    refreshing = (async () => {
+      await initGis();
+      const ov = showOverlay();
+      google.accounts.id.prompt();            // 자동 로그인 가능하면 창 없이 끝남
+      while (true) {
+        const cred = await waitCredential();
+        if (!cred) continue;
+        try {
+          const r = await post({ idToken: cred });
+          const prev = window.SOL_USER;
+          const auth = remember(r);
+          if (prev && auth.email !== prev) { location.reload(); return ''; }   // 계정이 바뀌면 화면을 새로 시작
+          window.SOL_TOKEN = auth.token;
+          ov.remove();
+          return auth.token;
+        } catch (e) {
+          ov.querySelector('.sol-ov-msg').textContent = e.message || '로그인에 실패했습니다.';
+        }
+      }
+    })().finally(() => { refreshing = null; });
+    return refreshing;
+  }
+  function showOverlay() {
+    let ov = document.getElementById('solReauth');
+    if (ov) return ov;
+    ov = document.createElement('div');
+    ov.id = 'solReauth';
+    ov.setAttribute('style', 'position:fixed;inset:0;z-index:2147483000;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:16px;font-family:inherit');
+    ov.innerHTML = '<div style="background:#fff;border-radius:14px;padding:26px 22px;max-width:340px;width:100%;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,.2)">'
+      + '<div style="font-size:16px;font-weight:600;margin-bottom:6px;color:#1f2937">접속 시간이 만료되었습니다</div>'
+      + '<div style="font-size:13px;color:#6b7280;line-height:1.5">다시 로그인하면 하던 작업을 그대로 이어갑니다.</div>'
+      + '<div class="sol-ov-btn" style="display:flex;justify-content:center;margin:18px 0 4px;min-height:44px"></div>'
+      + '<div class="sol-ov-msg" style="font-size:12px;color:#b91c1c;min-height:16px"></div></div>';
+    document.body.appendChild(ov);
+    renderButton(ov.querySelector('.sol-ov-btn'));
+    return ov;
+  }
+
+  /* ───── 서버 호출 (화면의 google.script.run.api 대체) ───── */
+  async function callBE(action, args, retried) {
+    const res = await fetch(CONFIG.BE_URL, { method: 'POST', redirect: 'follow',
+      body: JSON.stringify({ token: window.SOL_TOKEN, payload: JSON.stringify({ action: String(action), args: args || {} }) }) });
+    if (!res.ok) throw new Error('서버 응답 오류 (HTTP ' + res.status + ')');
+    const j = await res.json();
+    if (j && j.code === 'TOKEN' && !retried) { await refreshToken(); return callBE(action, args, true); }
+    return j;
+  }
+
+  /* ───── google.script 대체 (앱 화면 코드를 고치지 않고 그대로 쓰기 위함) ───── */
+  const IMPL = {
+    api: (action, args) => callBE(action, args),
+    newToken: () => refreshToken()
+  };
+  function runner(ok, fail) {
+    return new Proxy({}, { get(_, name) {
+      if (name === 'withSuccessHandler') return h => runner(h, fail);
+      if (name === 'withFailureHandler') return h => runner(ok, h);
+      if (name === 'withUserObject') return () => runner(ok, fail);
+      const fn = IMPL[name];
+      if (!fn) return undefined;
+      return (...a) => {
+        Promise.resolve().then(() => fn(...a)).then(
+          r => { if (ok) ok(r); },
+          e => { if (fail) fail(e); else console.error(e); });
+      };
+    } });
+  }
+  const historyShim = {
+    push(state, params, hash) { history.pushState(state, '', hash ? '#' + hash : location.pathname + location.search); },
+    replace(state, params, hash) { history.replaceState(state, '', hash ? '#' + hash : location.pathname + location.search); },
+    setChangeHandler(fn) { window.addEventListener('popstate', e => fn({ state: e.state, location: {} })); }
+  };
+
+  /* ───── 앱 화면 실행 ───── */
+  function launch(auth, html) {
+    if (!html) return say('앱 화면을 받지 못했습니다. BE에 app 파일이 있는지 확인하세요.', true);
+    window.SOL_USER = auth.email;
+    window.SOL_TOKEN = auth.token;
+    window.google = window.google || {};
+    window.google.script = {
+      get run() { return runner(null, null); },
+      history: historyShim,
+      host: { close() {}, setHeight() {}, setWidth() {}, editor: {} }
+    };
+    const headExtra =
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+      + '<link rel="manifest" href="manifest.webmanifest">'
+      + '<meta name="theme-color" content="#1f6f78">'
+      + '<link rel="icon" href="icon-192.png"><link rel="apple-touch-icon" href="icon-192.png">'
+      + '<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">'
+      + '<title>솔해연 인력관리</title>';
+    const page = html.indexOf('<head>') >= 0 ? html.replace('<head>', '<head>' + headExtra) : headExtra + html;
+    document.open();
+    document.write(page);
+    document.close();
+  }
+
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+  start().catch(e => say(e.message || String(e), true));
+})();
+</script>
+</body>
+</html>
